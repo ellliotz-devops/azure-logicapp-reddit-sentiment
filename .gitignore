@@ -1,0 +1,6 @@
+# Azure Logic Apps
+*.parameters.json
+*.deployments/
+*.history/
+.vscode/
+*.log
