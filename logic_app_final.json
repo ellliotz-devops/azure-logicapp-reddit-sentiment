@@ -112,7 +112,7 @@
                                         "method": "POST",
                                         "headers": {
                                             "Content-Type": "application/json",
-                                            "api-key": "9P97MWNofen40nAN2AlUs4fQOmMa308npVys1IQFww16rRQFvX5MJQQJ99CBACYeBjFXJ3w3AAABACOGBPi7"
+                                            "api-key": "[YOUR_OPENAI_API_KEY]"
                                         },
                                         "body": {
                                             "temperature": 0,
