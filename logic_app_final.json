@@ -1,311 +1,285 @@
 {
-    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
-    "contentVersion": "1.0.0.0",
-    "parameters": {
-        "workflows_la_reddit_aoai_sentiment_name": {
-            "defaultValue": "la-reddit-aoai-sentiment",
-            "type": "String"
+    "definition": {
+        "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+        "contentVersion": "1.0.0.0",
+        "triggers": {
+            "Recurrence": {
+                "recurrence": {
+                    "interval": 5,
+                    "frequency": "Minute"
+                },
+                "evaluatedRecurrence": {
+                    "interval": 5,
+                    "frequency": "Minute"
+                },
+                "type": "Recurrence"
+            }
         },
-        "connections_azuretables_externalid": {
-            "defaultValue": "/subscriptions/6ef7cd48-b43a-4b87-9eca-d0d75f3cae5e/resourceGroups/rg-logicapp-ai-lab/providers/Microsoft.Web/connections/azuretables",
-            "type": "String"
+        "actions": {
+            "HTTP_Get_RSS": {
+                "runAfter": {},
+                "type": "Http",
+                "inputs": {
+                    "uri": "https://www.reddit.com/r/popular/.rss?limit=10",
+                    "method": "GET",
+                    "headers": {
+                        "User-Agent": "AzureLogicAppLab/1.0 (interview demo)"
+                    }
+                }
+            },
+            "Compose_FeedXml": {
+                "runAfter": {
+                    "HTTP_Get_RSS": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Compose",
+                "inputs": "@xml(body('HTTP_Get_RSS'))"
+            },
+            "Compose_Entries": {
+                "runAfter": {
+                    "Compose_FeedXml": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Compose",
+                "inputs": "@xpath(outputs('Compose_FeedXml'), '//*[local-name()=\"entry\"]')"
+            },
+            "For_each_Post": {
+                "foreach": "@outputs('Compose_Entries')",
+                "actions": {
+                    "Compose_Title": {
+                        "type": "Compose",
+                        "inputs": "@xpath(items('For_each_Post'), '//*[local-name()=\"title\"]/text()')[0]"
+                    },
+                    "Compose_Link": {
+                        "runAfter": {
+                            "Compose_Title": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@xpath(items('For_each_Post'), '//*[local-name()=\"link\"]/@href')[0]"
+                    },
+                    "Compose_RowKey": {
+                        "runAfter": {
+                            "Compose_Clean_Summary": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@concat(guid(), '-', if(empty(outputs('Compose_Link')), 'nolink', substring(encodeUriComponent(outputs('Compose_Link')), 0, min(length(encodeUriComponent(outputs('Compose_Link'))), 200))))"
+                    },
+                    "HTTP_OpenAI_Sentiment": {
+                        "runAfter": {
+                            "Compose_RowKey": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Http",
+                        "inputs": {
+                            "uri": "https://aoai-ebz.openai.azure.com/openai/deployments/sentiment-json/chat/completions?api-version=2024-02-15-preview",
+                            "method": "POST",
+                            "headers": {
+                                "Content-Type": "application/json",
+                                "api-key": "9P97MWNofen40nAN2AlUs4fQOmMa308npVys1IQFww16rRQFvX5MJQQJ99CBACYeBjFXJ3w3AAABACOGBPi7"
+                            },
+                            "body": {
+                                "temperature": 0,
+                                "response_format": {
+                                    "type": "json_object"
+                                },
+                                "messages": [
+                                    {
+                                        "role": "system",
+                                        "content": "You are a classifier. Return ONLY valid JSON with keys: sentiment (positive|neutral|negative), score (0 to 1 float), severity (low|medium|high), reason (short one-sentence explanation)."
+                                    },
+                                    {
+                                        "role": "user",
+                                        "content": "@{concat('Classify this Reddit post entry.\nTitle: ', coalesce(outputs('Compose_Title'), ''), '\nSummary/Description: ', coalesce(outputs('Compose_Clean_Summary'), ''))}"
+                                    }
+                                ]
+                            }
+                        }
+                    },
+                    "Compose_ModelJsonText": {
+                        "runAfter": {
+                            "HTTP_OpenAI_Sentiment": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@body('HTTP_OpenAI_Sentiment')?['choices']?[0]?['message']?['content']"
+                    },
+                    "Parse_JSON_Sentiment": {
+                        "runAfter": {
+                            "Compose_ModelJsonText": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "ParseJson",
+                        "inputs": {
+                            "content": "@coalesce(outputs('Compose_ModelJsonText'), '{}')",
+                            "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "sentiment": {
+                                        "type": "string"
+                                    },
+                                    "score": {
+                                        "type": "number"
+                                    },
+                                    "severity": {
+                                        "type": "string"
+                                    },
+                                    "reason": {
+                                        "type": "string"
+                                    }
+                                },
+                                "required": [
+                                    "sentiment",
+                                    "score",
+                                    "severity",
+                                    "reason"
+                                ]
+                            }
+                        }
+                    },
+                    "Condition_Alert_Worthy": {
+                        "actions": {},
+                        "runAfter": {
+                            "Parse_JSON_Sentiment": [
+                                "Succeeded"
+                            ]
+                        },
+                        "else": {
+                            "actions": {}
+                        },
+                        "expression": "@or(equals(body('Parse_JSON_Sentiment')?['severity'], 'high'), and(equals(body('Parse_JSON_Sentiment')?['sentiment'], 'negative'), greaterOrEquals(float(coalesce(body('Parse_JSON_Sentiment')?['score'], 0)), 0.7)))",
+                        "type": "If"
+                    },
+                    "Insert_Entity_V2": {
+                        "runAfter": {
+                            "Condition_-_If_Entity_Does_Not_Exist": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "ApiConnection",
+                        "inputs": {
+                            "host": {
+                                "connection": {
+                                    "name": "@parameters('$connections')['azuretables']['connectionId']"
+                                }
+                            },
+                            "method": "post",
+                            "body": {
+                                "PartitionKey": "reddit-azure",
+                                "RowKey": "@outputs('Compose_RowKey')",
+                                "Title": "@coalesce(outputs('Compose_Title'), '')",
+                                "Link": "@coalesce(outputs('Compose_Link'), '')",
+                                "Sentiment": "@body('Parse_JSON_Sentiment')?['sentiment']",
+                                "Score": "@float(coalesce(body('Parse_JSON_Sentiment')?['score'], 0))",
+                                "Severity": "@body('Parse_JSON_Sentiment')?['severity']",
+                                "Reason": "@body('Parse_JSON_Sentiment')?['reason']",
+                                "Summary": "@coalesce(outputs('Compose_Summary'), '')",
+                                "ProcessedUtc": "@utcNow()"
+                            },
+                            "path": "/v2/storageAccounts/@{encodeURIComponent(encodeURIComponent('AccountNameFromSettings'))}/tables/@{encodeURIComponent('SentimentResults')}/entities"
+                        }
+                    },
+                    "Compose_Summary": {
+                        "runAfter": {
+                            "Compose_Link": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@xpath(items('For_each_Post'), '//*[local-name()=\"content\"]/text()')[0]"
+                    },
+                    "Compose_Clean_Summary": {
+                        "runAfter": {
+                            "Compose_Summary": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "Compose",
+                        "inputs": "@trim(\n  replace(\n    replace(\n      replace(\n        replace(outputs('Compose_Summary'), '&lt;!-- SC_OFF --&gt;', ''),\n        '&lt;!-- SC_ON --&gt;', ''\n      ),\n      '&lt;div class=\"md\"&gt;', ''\n    ),\n    '&lt;/div&gt;', ''\n  )\n)"
+                    },
+                    "Get_entity_(V2)": {
+                        "runAfter": {
+                            "Condition_Alert_Worthy": [
+                                "Succeeded"
+                            ]
+                        },
+                        "type": "ApiConnection",
+                        "inputs": {
+                            "host": {
+                                "connection": {
+                                    "name": "@parameters('$connections')['azuretables-1']['connectionId']"
+                                }
+                            },
+                            "method": "get",
+                            "path": "/v2/storageAccounts/@{encodeURIComponent(encodeURIComponent('AccountNameFromSettings'))}/tables/@{encodeURIComponent('SentimentResults')}/entities(PartitionKey='@{encodeURIComponent('reddit-azure')}',RowKey='@{encodeURIComponent(outputs('Compose_RowKey'))}')"
+                        }
+                    },
+                    "Condition_-_If_Entity_Does_Not_Exist": {
+                        "actions": {},
+                        "runAfter": {
+                            "Get_entity_(V2)": [
+                                "Succeeded",
+                                "Skipped",
+                                "Failed"
+                            ]
+                        },
+                        "else": {
+                            "actions": {}
+                        },
+                        "expression": {
+                            "and": [
+                                {
+                                    "equals": [
+                                        "@empty(body('Get_entity_(V2)'))",
+                                        true
+                                    ]
+                                }
+                            ]
+                        },
+                        "type": "If"
+                    }
+                },
+                "runAfter": {
+                    "Compose_Entries": [
+                        "Succeeded"
+                    ]
+                },
+                "type": "Foreach"
+            }
+        },
+        "outputs": {},
+        "parameters": {
+            "$connections": {
+                "type": "Object",
+                "defaultValue": {}
+            }
         }
     },
-    "variables": {},
-    "resources": [
-        {
-            "type": "Microsoft.Logic/workflows",
-            "apiVersion": "2017-07-01",
-            "name": "[parameters('workflows_la_reddit_aoai_sentiment_name')]",
-            "location": "eastus",
-            "identity": {
-                "type": "SystemAssigned"
-            },
-            "properties": {
-                "state": "Enabled",
-                "definition": {
-                    "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
-                    "contentVersion": "1.0.0.0",
-                    "parameters": {
-                        "$connections": {
-                            "defaultValue": {},
-                            "type": "Object"
-                        }
-                    },
-                    "triggers": {
-                        "Recurrence": {
-                            "recurrence": {
-                                "interval": 5,
-                                "frequency": "Minute"
-                            },
-                            "evaluatedRecurrence": {
-                                "interval": 5,
-                                "frequency": "Minute"
-                            },
-                            "type": "Recurrence"
-                        }
-                    },
-                    "actions": {
-                        "HTTP_Get_RSS": {
-                            "runAfter": {},
-                            "type": "Http",
-                            "inputs": {
-                                "uri": "https://www.reddit.com/r/popular/.rss?limit=10",
-                                "method": "GET",
-                                "headers": {
-                                    "User-Agent": "AzureLogicAppLab/1.0 (interview demo)"
-                                }
-                            }
-                        },
-                        "Compose_FeedXml": {
-                            "runAfter": {
-                                "HTTP_Get_RSS": [
-                                    "Succeeded"
-                                ]
-                            },
-                            "type": "Compose",
-                            "inputs": "@xml(body('HTTP_Get_RSS'))"
-                        },
-                        "Compose_Entries": {
-                            "runAfter": {
-                                "Compose_FeedXml": [
-                                    "Succeeded"
-                                ]
-                            },
-                            "type": "Compose",
-                            "inputs": "@xpath(outputs('Compose_FeedXml'), '//*[local-name()=\"entry\"]')"
-                        },
-                        "For_each_Post": {
-                            "foreach": "@outputs('Compose_Entries')",
-                            "actions": {
-                                "Compose_Title": {
-                                    "type": "Compose",
-                                    "inputs": "@xpath(items('For_each_Post'), '//*[local-name()=\"title\"]/text()')[0]"
-                                },
-                                "Compose_Link": {
-                                    "runAfter": {
-                                        "Compose_Title": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "Compose",
-                                    "inputs": "@xpath(items('For_each_Post'), '//*[local-name()=\"link\"]/@href')[0]"
-                                },
-                                "Compose_RowKey": {
-                                    "runAfter": {
-                                        "Compose_Clean_Summary": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "Compose",
-                                    "inputs": "@concat(guid(), '-', if(empty(outputs('Compose_Link')), 'nolink', substring(encodeUriComponent(outputs('Compose_Link')), 0, min(length(encodeUriComponent(outputs('Compose_Link'))), 200))))"
-                                },
-                                "HTTP_OpenAI_Sentiment": {
-                                    "runAfter": {
-                                        "Compose_RowKey": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "Http",
-                                    "inputs": {
-                                        "uri": "https://aoai-ebz.openai.azure.com/openai/deployments/sentiment-json/chat/completions?api-version=2024-02-15-preview",
-                                        "method": "POST",
-                                        "headers": {
-                                            "Content-Type": "application/json",
-                                            "api-key": "[YOUR_OPENAI_API_KEY]"
-                                        },
-                                        "body": {
-                                            "temperature": 0,
-                                            "response_format": {
-                                                "type": "json_object"
-                                            },
-                                            "messages": [
-                                                {
-                                                    "role": "system",
-                                                    "content": "You are a classifier. Return ONLY valid JSON with keys: sentiment (positive|neutral|negative), score (0 to 1 float), severity (low|medium|high), reason (short one-sentence explanation)."
-                                                },
-                                                {
-                                                    "role": "user",
-                                                    "content": "@{concat('Classify this Reddit post entry.\nTitle: ', coalesce(outputs('Compose_Title'), ''), '\nSummary/Description: ', coalesce(outputs('Compose_Clean_Summary'), ''))}"
-                                                }
-                                            ]
-                                        }
-                                    }
-                                },
-                                "Compose_ModelJsonText": {
-                                    "runAfter": {
-                                        "HTTP_OpenAI_Sentiment": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "Compose",
-                                    "inputs": "@body('HTTP_OpenAI_Sentiment')?['choices']?[0]?['message']?['content']"
-                                },
-                                "Parse_JSON_Sentiment": {
-                                    "runAfter": {
-                                        "Compose_ModelJsonText": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "ParseJson",
-                                    "inputs": {
-                                        "content": "@coalesce(outputs('Compose_ModelJsonText'), '{}')",
-                                        "schema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "sentiment": {
-                                                    "type": "string"
-                                                },
-                                                "score": {
-                                                    "type": "number"
-                                                },
-                                                "severity": {
-                                                    "type": "string"
-                                                },
-                                                "reason": {
-                                                    "type": "string"
-                                                }
-                                            },
-                                            "required": [
-                                                "sentiment",
-                                                "score",
-                                                "severity",
-                                                "reason"
-                                            ]
-                                        }
-                                    }
-                                },
-                                "Condition_Alert_Worthy": {
-                                    "actions": {},
-                                    "runAfter": {
-                                        "Parse_JSON_Sentiment": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "else": {
-                                        "actions": {}
-                                    },
-                                    "expression": "@or(equals(body('Parse_JSON_Sentiment')?['severity'], 'high'), and(equals(body('Parse_JSON_Sentiment')?['sentiment'], 'negative'), greaterOrEquals(float(coalesce(body('Parse_JSON_Sentiment')?['score'], 0)), 0.7)))",
-                                    "type": "If"
-                                },
-                                "Insert_Entity_V2": {
-                                    "runAfter": {
-                                        "Condition_-_If_Entity_Does_Not_Exist": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "ApiConnection",
-                                    "inputs": {
-                                        "host": {
-                                            "connection": {
-                                                "name": "@parameters('$connections')['azuretables']['connectionId']"
-                                            }
-                                        },
-                                        "method": "post",
-                                        "body": {
-                                            "PartitionKey": "reddit-azure",
-                                            "RowKey": "@outputs('Compose_RowKey')",
-                                            "Title": "@coalesce(outputs('Compose_Title'), '')",
-                                            "Link": "@coalesce(outputs('Compose_Link'), '')",
-                                            "Sentiment": "@body('Parse_JSON_Sentiment')?['sentiment']",
-                                            "Score": "@float(coalesce(body('Parse_JSON_Sentiment')?['score'], 0))",
-                                            "Severity": "@body('Parse_JSON_Sentiment')?['severity']",
-                                            "Reason": "@body('Parse_JSON_Sentiment')?['reason']",
-                                            "Summary": "@coalesce(outputs('Compose_Summary'), '')",
-                                            "ProcessedUtc": "@utcNow()"
-                                        },
-                                        "path": "/v2/storageAccounts/@{encodeURIComponent(encodeURIComponent('AccountNameFromSettings'))}/tables/@{encodeURIComponent('SentimentResults')}/entities"
-                                    }
-                                },
-                                "Compose_Summary": {
-                                    "runAfter": {
-                                        "Compose_Link": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "Compose",
-                                    "inputs": "@xpath(items('For_each_Post'), '//*[local-name()=\"content\"]/text()')[0]"
-                                },
-                                "Compose_Clean_Summary": {
-                                    "runAfter": {
-                                        "Compose_Summary": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "Compose",
-                                    "inputs": "@trim(\n  replace(\n    replace(\n      replace(\n        replace(outputs('Compose_Summary'), '&lt;!-- SC_OFF --&gt;', ''),\n        '&lt;!-- SC_ON --&gt;', ''\n      ),\n      '&lt;div class=\"md\"&gt;', ''\n    ),\n    '&lt;/div&gt;', ''\n  )\n)"
-                                },
-                                "Get_entity_(V2)": {
-                                    "runAfter": {
-                                        "Condition_Alert_Worthy": [
-                                            "Succeeded"
-                                        ]
-                                    },
-                                    "type": "ApiConnection",
-                                    "inputs": {
-                                        "host": {
-                                            "connection": {
-                                                "name": "@parameters('$connections')['azuretables-1']['connectionId']"
-                                            }
-                                        },
-                                        "method": "get",
-                                        "path": "/v2/storageAccounts/@{encodeURIComponent(encodeURIComponent('AccountNameFromSettings'))}/tables/@{encodeURIComponent('SentimentResults')}/entities(PartitionKey='@{encodeURIComponent('reddit-azure')}',RowKey='@{encodeURIComponent(outputs('Compose_RowKey'))}')"
-                                    }
-                                },
-                                "Condition_-_If_Entity_Does_Not_Exist": {
-                                    "actions": {},
-                                    "runAfter": {
-                                        "Get_entity_(V2)": [
-                                            "Succeeded",
-                                            "Skipped",
-                                            "Failed"
-                                        ]
-                                    },
-                                    "else": {
-                                        "actions": {}
-                                    },
-                                    "expression": {
-                                        "and": [
-                                            {
-                                                "equals": [
-                                                    "@empty(body('Get_entity_(V2)'))",
-                                                    true
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    "type": "If"
-                                }
-                            },
-                            "runAfter": {
-                                "Compose_Entries": [
-                                    "Succeeded"
-                                ]
-                            },
-                            "type": "Foreach"
-                        }
-                    },
-                    "outputs": {}
+    "parameters": {
+        "$connections": {
+            "type": "Object",
+            "value": {
+                "azuretables": {
+                    "id": "/subscriptions/6ef7cd48-b43a-4b87-9eca-d0d75f3cae5e/providers/Microsoft.Web/locations/eastus/managedApis/azuretables",
+                    "connectionId": "/subscriptions/6ef7cd48-b43a-4b87-9eca-d0d75f3cae5e/resourceGroups/rg-logicapp-ai-lab/providers/Microsoft.Web/connections/azuretables",
+                    "connectionName": "azuretables",
+                    "connectionProperties": {}
                 },
-                "parameters": {
-                    "$connections": {
-                        "value": {
-                            "azuretables": {
-                                "id": "/subscriptions/6ef7cd48-b43a-4b87-9eca-d0d75f3cae5e/providers/Microsoft.Web/locations/eastus/managedApis/azuretables",
-                                "connectionId": "[parameters('connections_azuretables_externalid')]",
-                                "connectionName": "azuretables",
-                                "connectionProperties": {}
-                            },
-                            "azuretables-1": {
-                                "id": "/subscriptions/6ef7cd48-b43a-4b87-9eca-d0d75f3cae5e/providers/Microsoft.Web/locations/eastus/managedApis/azuretables",
-                                "connectionId": "[parameters('connections_azuretables_externalid')]",
-                                "connectionName": "azuretables",
-                                "connectionProperties": {}
-                            }
-                        }
-                    }
+                "azuretables-1": {
+                    "id": "/subscriptions/6ef7cd48-b43a-4b87-9eca-d0d75f3cae5e/providers/Microsoft.Web/locations/eastus/managedApis/azuretables",
+                    "connectionId": "/subscriptions/6ef7cd48-b43a-4b87-9eca-d0d75f3cae5e/resourceGroups/rg-logicapp-ai-lab/providers/Microsoft.Web/connections/azuretables",
+                    "connectionName": "azuretables",
+                    "connectionProperties": {}
                 }
             }
         }
-    ]
+    }
 }
