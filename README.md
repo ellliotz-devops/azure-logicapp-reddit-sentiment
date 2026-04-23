@@ -22,3 +22,7 @@ The workflow:
 2. Retrieves posts from selected subreddits
 3. Processes text through Azure AI sentiment analysis
 4. Stores and evaluates results
+
+## Architecture Diagram
+
+![Architecture](architecture.png)
